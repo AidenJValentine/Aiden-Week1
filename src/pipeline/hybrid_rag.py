@@ -37,7 +37,7 @@ def _classify_question(question: str) -> str:
     q = question.lower()
     if any(term in q for term in ["compare", "vs", "versus"]):
         return "comparison"
-    if any(term in q for term in ["customer need", "needs", "pain point", "requirement"]):
+    if any(term in q for term in ["customer need", "pain point", "requirement"]):
         return "customer_needs"
     if any(term in q for term in ["segment", "customer group", "who buys", "buyer"]):
         return "customer_segments"
@@ -75,6 +75,45 @@ def _match_products(question: str, limit: int = 4) -> List[str]:
             scored.append((overlap, product))
     scored.sort(key=lambda item: (-item[0], item[1]))
     return [product for _, product in scored[:limit]]
+
+
+def _extract_comparison_products(question: str, known_products: List[str]) -> List[str]:
+    """Extract both product names from a comparison question using regex, then match against known products."""
+    q = question.lower().strip()
+    segments: List[str] = []
+
+    patterns = [
+        r"compare\s+(.+?)\s+(?:vs\.?|versus|with|and|to)\s+(.+?)(?:\?|$)",
+        r"(.+?)\s+(?:vs\.?|versus)\s+(.+?)(?:\?|$)",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, q)
+        if m:
+            segments = [m.group(1).strip(), m.group(2).strip()]
+            break
+
+    if not segments:
+        return []
+
+    results: List[str] = []
+    seen: set = set()
+    for segment in segments:
+        seg_tokens = set(_tokenize(segment))
+        best_product = None
+        best_score = 0
+        for product in known_products:
+            if product in seen:
+                continue
+            prod_tokens = set(_tokenize(product))
+            score = len(prod_tokens.intersection(seg_tokens))
+            if score > best_score:
+                best_score = score
+                best_product = product
+        if best_product and best_score > 0:
+            results.append(best_product)
+            seen.add(best_product)
+
+    return results
 
 
 def _fetch_product_details(products: List[str]) -> List[Dict[str, Any]]:
@@ -244,8 +283,11 @@ def _retrieve_neo4j_context(question: str) -> List[Dict[str, Any]]:
     question_type = _classify_question(question)
     products = _match_products(question)
 
-    if question_type == "comparison" and products:
-        return _fetch_product_details(products[:2])
+    if question_type == "comparison":
+        comparison_products = _extract_comparison_products(question, products or [])
+        target = comparison_products if len(comparison_products) >= 2 else (products[:2] if products else [])
+        if target:
+            return _fetch_product_details(target)
     if question_type == "product_specs" and products:
         return _fetch_product_details(products[:2])
     if question_type == "competitors":
@@ -447,7 +489,14 @@ Chroma context:
 
 def answer_hybrid_question(question: str) -> Dict[str, Any]:
     question_type = _classify_question(question)
-    neo4j_rows = _retrieve_neo4j_context(question)
+
+    neo4j_error: str = ""
+    neo4j_rows: List[Dict[str, Any]] = []
+    try:
+        neo4j_rows = _retrieve_neo4j_context(question)
+    except Exception as exc:
+        neo4j_error = str(exc)
+
     chroma_chunks = _retrieve_chroma_context(question, neo4j_rows)
 
     llm_used = True
@@ -457,7 +506,7 @@ def answer_hybrid_question(question: str) -> Dict[str, Any]:
         llm_used = False
         answer = _fallback_answer(question, question_type, neo4j_rows, chroma_chunks)
 
-    return {
+    result: Dict[str, Any] = {
         "question": question,
         "question_type": question_type,
         "answer": answer,
@@ -465,6 +514,9 @@ def answer_hybrid_question(question: str) -> Dict[str, Any]:
         "neo4j_sources": neo4j_rows,
         "chroma_sources": chroma_chunks,
     }
+    if neo4j_error:
+        result["neo4j_error"] = neo4j_error
+    return result
 
 
 __all__ = ["answer_hybrid_question"]

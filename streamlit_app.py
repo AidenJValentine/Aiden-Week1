@@ -706,6 +706,21 @@ def render_hybrid_sources(response: Dict[str, Any]):
                         [{"Specification": spec.get("spec_type", ""), "Value": spec.get("value", "")} for spec in specs[:10]]
                     )
                     st.dataframe(spec_df, width="stretch", hide_index=True)
+                    # Collect and display unique source URLs from specs, needs, and segments
+                    spec_urls = []
+                    for spec in specs[:10]:
+                        for url in (spec.get("source_urls") or []):
+                            if url and url not in spec_urls:
+                                spec_urls.append(url)
+                    for need in (row.get("needs") or [])[:5]:
+                        for url in (need.get("source_urls") or []):
+                            if url and url not in spec_urls:
+                                spec_urls.append(url)
+                    if spec_urls:
+                        st.markdown("Sources: " + " · ".join(
+                            f"[{i+1}]({url})" if _is_valid_http_url(url) else f"{i+1}: {url}"
+                            for i, url in enumerate(spec_urls[:3])
+                        ))
                 if row.get("needs"):
                     st.markdown("Linked customer needs:")
                     for need in row["needs"][:5]:
@@ -746,11 +761,17 @@ def render_hybrid_sources(response: Dict[str, Any]):
 
 def render_chat_tab():
     """Render the Week 2 hybrid chat interface."""
-    st.markdown("""
-    <div class="section-header">
-        <h2>💬 Hybrid Chat Interface</h2>
-    </div>
-    """, unsafe_allow_html=True)
+    header_col, clear_col = st.columns([8, 1])
+    with header_col:
+        st.markdown("""
+        <div class="section-header">
+            <h2>💬 Hybrid Chat Interface</h2>
+        </div>
+        """, unsafe_allow_html=True)
+    with clear_col:
+        if st.button("🗑️ Clear", key="chat_clear_history"):
+            st.session_state.chat_messages = []
+            st.rerun()
 
     st.markdown("Ask a natural-language question. The app combines Neo4j facts with ChromaDB evidence and shows both citation types.")
 
@@ -791,6 +812,8 @@ def render_chat_tab():
             with st.spinner("Searching Neo4j and ChromaDB..."):
                 try:
                     response = answer_hybrid_question(prompt)
+                    if response.get("neo4j_error"):
+                        st.warning(f"Neo4j unavailable — showing ChromaDB-only results. ({response['neo4j_error']})")
                     st.markdown(response["answer"])
                     render_hybrid_sources(response)
                     st.caption(
