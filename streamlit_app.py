@@ -27,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from src.config.settings import get_neo4j_config
 from src.pipeline.chroma_store import find_best_evidence_for_relationship, get_chunk_by_id
+from src.pipeline.hybrid_rag import answer_hybrid_question
 from src.ontology.specifications import PRESSURE_TRANSMITTER_ONTOLOGY
 
 # =============================================================================
@@ -122,7 +123,17 @@ st.markdown("""
 def get_neo4j_driver():
     """Create Neo4j connection."""
     cfg = get_neo4j_config()
+    if not cfg['uri'] or not cfg['user'] or not cfg['password']:
+        raise RuntimeError(
+            "Neo4j is not configured. Add NEO4J_URI, NEO4J_USER, and NEO4J_PASSWORD to your .env file."
+        )
     return GraphDatabase.driver(cfg['uri'], auth=(cfg['user'], cfg['password']))
+
+
+def is_neo4j_configured() -> bool:
+    """Return True when the required Neo4j settings are present."""
+    cfg = get_neo4j_config()
+    return bool(cfg.get("uri") and cfg.get("user") and cfg.get("password"))
 
 
 def fetch_all_products_with_specs() -> pd.DataFrame:
@@ -674,6 +685,136 @@ def evaluate_entity(entity_name: str, entity_value: str, evidence_ids: list) -> 
     }
 
 
+def render_hybrid_sources(response: Dict[str, Any]):
+    """Render hybrid retrieval citations for the chat interface."""
+    neo4j_sources = response.get("neo4j_sources", [])
+    chroma_sources = response.get("chroma_sources", [])
+
+    with st.expander("🕸️ Neo4j Structured Data", expanded=True):
+        if not neo4j_sources:
+            st.caption("No structured Neo4j data matched this question.")
+        for index, row in enumerate(neo4j_sources, start=1):
+            label = f"Neo4j S{index}"
+            kind = row.get("kind", "")
+
+            if kind == "product":
+                st.markdown(f"**[{label}] {row.get('product', 'Unknown product')}**")
+                st.caption(f"Company: {row.get('company', 'Unknown')}")
+                specs = row.get("specs", [])
+                if specs:
+                    spec_df = pd.DataFrame(
+                        [{"Specification": spec.get("spec_type", ""), "Value": spec.get("value", "")} for spec in specs[:10]]
+                    )
+                    st.dataframe(spec_df, width="stretch", hide_index=True)
+                if row.get("needs"):
+                    st.markdown("Linked customer needs:")
+                    for need in row["needs"][:5]:
+                        threshold = need.get("threshold") or "n/a"
+                        st.markdown(f"- {need.get('name', 'Unknown')} | threshold: {threshold}")
+                if row.get("segments"):
+                    st.markdown("Linked customer segments:")
+                    for segment in row["segments"][:5]:
+                        st.markdown(f"- {segment.get('name', 'Unknown')}")
+            elif kind == "competitor":
+                products = ", ".join(row.get("products", [])) or "No linked products"
+                st.markdown(f"**[{label}] {row.get('company', 'Unknown company')}**")
+                st.caption(f"Products: {products}")
+            elif kind == "customer_need":
+                products = ", ".join(row.get("products", [])) or "No linked products"
+                st.markdown(f"**[{label}] {row.get('need', 'Unknown need')}**")
+                st.caption(f"Threshold: {row.get('threshold', 'n/a') or 'n/a'}")
+                st.caption(f"Products: {products}")
+            elif kind == "customer_segment":
+                products = ", ".join(row.get("products", [])) or "No linked products"
+                st.markdown(f"**[{label}] {row.get('segment', 'Unknown segment')}**")
+                st.caption(f"Products: {products}")
+
+    with st.expander("📚 ChromaDB Evidence", expanded=True):
+        if not chroma_sources:
+            st.caption("No ChromaDB chunks matched this question.")
+        for index, chunk in enumerate(chroma_sources, start=1):
+            metadata = chunk.get("metadata", {})
+            source_url = metadata.get("source_url", "")
+            method = chunk.get("retrieval_method", "semantic_search")
+            st.markdown(f"**[Chroma C{index}] {chunk.get('id', '')}**")
+            st.caption(f"Retrieved via: {method}")
+            if _is_valid_http_url(source_url):
+                st.markdown(f"Source: [{source_url[:90]}...]({source_url})")
+            text = chunk.get("document", "") or ""
+            st.info(text[:700] + ("..." if len(text) > 700 else ""))
+
+
+def render_chat_tab():
+    """Render the Week 2 hybrid chat interface."""
+    st.markdown("""
+    <div class="section-header">
+        <h2>💬 Hybrid Chat Interface</h2>
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.markdown("Ask a natural-language question. The app combines Neo4j facts with ChromaDB evidence and shows both citation types.")
+
+    examples = [
+        "Compare Rosemount 3051S with SmartLine ST700",
+        "What competitors does Honeywell have?",
+        "What customer needs show up in oil and gas?",
+    ]
+    cols = st.columns(len(examples))
+    for col, example in zip(cols, examples):
+        with col:
+            if st.button(example, key=f"chat_example_{example}"):
+                st.session_state.chat_pending_prompt = example
+
+    st.markdown("---")
+
+    for message in st.session_state.chat_messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+            if message["role"] == "assistant" and message.get("response_payload"):
+                render_hybrid_sources(message["response_payload"])
+                st.caption(
+                    f"Question type: {message['response_payload'].get('question_type', 'general')} | "
+                    f"LLM used: {'Yes' if message['response_payload'].get('llm_used') else 'No'}"
+                )
+
+    prompt = st.chat_input("Ask about products, competitors, customer needs, or segments")
+    if not prompt and st.session_state.get("chat_pending_prompt"):
+        prompt = st.session_state.chat_pending_prompt
+        st.session_state.chat_pending_prompt = ""
+
+    if prompt:
+        st.session_state.chat_messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+
+        with st.chat_message("assistant"):
+            with st.spinner("Searching Neo4j and ChromaDB..."):
+                try:
+                    response = answer_hybrid_question(prompt)
+                    st.markdown(response["answer"])
+                    render_hybrid_sources(response)
+                    st.caption(
+                        f"Question type: {response.get('question_type', 'general')} | "
+                        f"LLM used: {'Yes' if response.get('llm_used') else 'No'}"
+                    )
+                    st.session_state.chat_messages.append(
+                        {
+                            "role": "assistant",
+                            "content": response["answer"],
+                            "response_payload": response,
+                        }
+                    )
+                except Exception as e:
+                    error_message = f"I ran into an issue while querying the data sources: {e}"
+                    st.error(error_message)
+                    st.session_state.chat_messages.append(
+                        {
+                            "role": "assistant",
+                            "content": error_message,
+                        }
+                    )
+
+
 # =============================================================================
 # MAIN APP
 # =============================================================================
@@ -688,6 +829,10 @@ def main():
         st.session_state.rejected_relationships = set()
     if 'selected_products' not in st.session_state:
         st.session_state.selected_products = []
+    if 'chat_messages' not in st.session_state:
+        st.session_state.chat_messages = []
+    if 'chat_pending_prompt' not in st.session_state:
+        st.session_state.chat_pending_prompt = ""
     
     # === HEADER ===
     st.markdown("""
@@ -701,6 +846,8 @@ def main():
     with st.sidebar:
         st.markdown("### 🤖 Agentic Pipeline")
         st.markdown("Run the AI agent to collect competitive intelligence.")
+        if not is_neo4j_configured():
+            st.warning("Neo4j is not configured. Add NEO4J_URI, NEO4J_USER, and NEO4J_PASSWORD to `.env`.")
         
         target_product = st.text_input("Target Product", "SmartLine ST700")
         max_competitors = st.slider("Max Competitors", 1, 10, 5)
@@ -739,7 +886,8 @@ def main():
         "🎯 Customer Needs",
         "👥 Customer Segments",
         "🏠 House of Quality",
-        "📈 Evaluation"
+        "📈 Evaluation",
+        "💬 Chat"
     ])
     
     # === TAB 1: KNOWLEDGE GRAPH ===
@@ -1768,7 +1916,7 @@ K → °C: K - 273.15
                         })
                     
                     df = pd.DataFrame(table_data)
-                    st.dataframe(df, use_container_width=True)
+                    st.dataframe(df, width="stretch")
                     
                 else:
                     st.info("No customer needs found. Run the pipeline with customer needs research enabled.")
@@ -1910,7 +2058,7 @@ K → °C: K - 273.15
                         })
                     
                     mapping_df = pd.DataFrame(mapping_table)
-                    st.dataframe(mapping_df, use_container_width=True)
+                    st.dataframe(mapping_df, width="stretch")
                 
                 # Summary table
                 st.markdown("<br>", unsafe_allow_html=True)
@@ -1928,7 +2076,7 @@ K → °C: K - 273.15
                     })
                 
                 df = pd.DataFrame(table_data)
-                st.dataframe(df, use_container_width=True)
+                st.dataframe(df, width="stretch")
                 
                 # Sources list
                 st.markdown("<br>", unsafe_allow_html=True)
@@ -2031,7 +2179,7 @@ K → °C: K - 273.15
                     matrix_data.append(row)
                 
                 matrix_df = pd.DataFrame(matrix_data)
-                st.dataframe(matrix_df, use_container_width=True, height=400)
+                st.dataframe(matrix_df, width="stretch", height=400)
                 
                 # Show reasoning for each need
                 with st.expander("📝 View Reasoning for Relationships"):
@@ -2086,7 +2234,7 @@ K → °C: K - 273.15
                     comp_data.append(row)
                 
                 comp_df = pd.DataFrame(comp_data)
-                st.dataframe(comp_df, use_container_width=True)
+                st.dataframe(comp_df, width="stretch")
                 
                 # Product assessments with detailed score reasons
                 with st.expander("📋 Product Assessments & Score Reasoning"):
@@ -2128,7 +2276,7 @@ K → °C: K - 273.15
                     })
                 
                 corr_df = pd.DataFrame(corr_data)
-                st.dataframe(corr_df, use_container_width=True)
+                st.dataframe(corr_df, width="stretch")
             
             st.markdown("---")
             
@@ -2191,7 +2339,11 @@ K → °C: K - 273.15
                 pass
         
         # Fetch data from Neo4j
-        driver = get_neo4j_driver()
+        try:
+            driver = get_neo4j_driver()
+        except Exception as e:
+            driver = None
+            st.info(f"Evaluation requires Neo4j. {e}")
         
         competitors_eval = []
         products_eval = []
@@ -2200,6 +2352,8 @@ K → °C: K - 273.15
         segments_eval = []
         
         try:
+            if driver is None:
+                raise RuntimeError("Neo4j driver unavailable")
             with driver.session() as session:
                 # Get competitors with evidence (evidence is on COMPETES_WITH relationship)
                 result = session.run("""
@@ -2302,9 +2456,11 @@ K → °C: K - 273.15
                         "evidence_ids": evidence_ids
                     })
         except Exception as e:
-            st.error(f"Error fetching data: {e}")
+            if driver is not None:
+                st.error(f"Error fetching data: {e}")
         finally:
-            driver.close()
+            if driver is not None:
+                driver.close()
         
         # Calculate evaluations
         all_evaluations = {
@@ -2541,7 +2697,7 @@ K → °C: K - 273.15
         
         if summary_data:
             summary_df = pd.DataFrame(summary_data)
-            st.dataframe(summary_df, use_container_width=True)
+            st.dataframe(summary_df, width="stretch")
         
         st.markdown("---")
         
@@ -2565,6 +2721,10 @@ K → °C: K - 273.15
             st.markdown("**Note:** If evidence_ids is empty, the data may not have been linked properly during extraction, or ChromaDB was reset.")
         
         st.caption("Evaluation compares LLM extractions against source content stored in ChromaDB. Higher scores indicate the extracted value appears in the original source text.")
+
+    # === TAB 11: CHAT ===
+    with tabs[10]:
+        render_chat_tab()
 
 
 if __name__ == "__main__":
